@@ -8,7 +8,8 @@ export enum AgentState {
   BUILD = 'BUILD',
   WANDER = 'WANDER',
   DELIVER = 'DELIVER',
-  TRAIN = 'TRAIN'
+  TRAIN = 'TRAIN',
+  GUARD = 'GUARD'
 }
 
 export type BuildingType = 'HUT' | 'WARRIOR_HUT' | 'TOWER' | 'TEMPLE';
@@ -38,7 +39,7 @@ export interface Building extends Entity {
   type: BuildingType;
   progress: number; // 0 to 100
   isComplete: boolean;
-  assignedWorkers: string[];
+  assignedWorkers: string[]; // List of follower IDs
 }
 
 export interface Follower extends Entity {
@@ -47,7 +48,17 @@ export interface Follower extends Entity {
   targetId: string | null;
   targetPos: Vector3 | null;
   woodCarrying: number;
-  isShaman?: boolean; // Kept for backwards compatibility if needed, but role is preferred
+  isShaman?: boolean;
+}
+
+export interface Enemy extends Entity {
+  health: number;
+  targetPos: Vector3;
+}
+
+export interface Projectile extends Entity {
+  targetId: string;
+  velocity: Vector3;
 }
 
 export interface GameState {

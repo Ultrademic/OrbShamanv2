@@ -13,12 +13,15 @@ import {
   INTERACTION_RANGE,
   GROWTH_RATE,
   BASE_POSITION,
-  WOOD_CAPACITY
+  WOOD_CAPACITY,
+  TOWER_CAPACITY,
+  TOWER_RANGE,
+  FIRE_RATE,
+  PROJECTILE_SPEED
 } from '../constants';
-import { AgentState, Tree, Building, Follower, BuildingType, FollowerRole } from '../types';
+import { AgentState, Tree, Building, Follower, BuildingType, FollowerRole, Enemy, Projectile } from '../types';
 import { getRandomSurfacePos, projectToSurface, moveOnSphere } from '../utils';
 
-// Helper component to align its children to the surface normal
 const SurfaceAligned: React.FC<{ position: THREE.Vector3; children: React.ReactNode }> = ({ position, children }) => {
   const quaternion = useMemo(() => {
     const normal = position.clone().normalize();
@@ -29,6 +32,25 @@ const SurfaceAligned: React.FC<{ position: THREE.Vector3; children: React.ReactN
     <group position={position} quaternion={quaternion}>
       {children}
     </group>
+  );
+};
+
+const FirewoodPile: React.FC<{ position: THREE.Vector3; seed: number }> = ({ position, seed }) => {
+  const rotationOffset = useMemo(() => seed * Math.PI, [seed]);
+  return (
+    <SurfaceAligned position={position}>
+      <group rotation={[0, rotationOffset, 0]}>
+        <Cylinder args={[0.08, 0.08, 0.7, 6]} position={[0, 0.08, 0]} rotation={[Math.PI / 2, 0, 0.4]}>
+          <meshStandardMaterial color="#4a3728" roughness={1} />
+        </Cylinder>
+        <Cylinder args={[0.08, 0.08, 0.7, 6]} position={[0, 0.08, 0]} rotation={[Math.PI / 2, 0, -0.6]}>
+          <meshStandardMaterial color="#3d2b1f" roughness={1} />
+        </Cylinder>
+        <Cylinder args={[0.08, 0.08, 0.7, 6]} position={[0, 0.2, 0]} rotation={[Math.PI / 2, 0, 0]}>
+          <meshStandardMaterial color="#5c4033" roughness={1} />
+        </Cylinder>
+      </group>
+    </SurfaceAligned>
   );
 };
 
@@ -52,8 +74,29 @@ const World: React.FC<WorldProps> = ({
   onPlacedBuilding 
 }) => {
   const growthTimer = useRef(0);
-  const [selectedFollowerId, setSelectedFollowerId] = useState<string | null>(null);
+  const enemySpawnTimer = useRef(0);
+  const towerFireTimers = useRef<Record<string, number>>({});
   
+  const [selectedFollowerId, setSelectedFollowerId] = useState<string | null>(null);
+  const [enemies, setEnemies] = useState<Enemy[]>([]);
+  const [projectiles, setProjectiles] = useState<Projectile[]>([]);
+
+  const woodPilePositions = useMemo(() => {
+    const piles: THREE.Vector3[] = [];
+    const rings = 6;
+    const basePiles = 8;
+    for (let r = 1; r <= rings; r++) {
+      const radius = 1.0 + r * 0.55;
+      const count = basePiles * r;
+      for (let i = 0; i < count; i++) {
+        const angle = (i / count) * Math.PI * 2;
+        const offset = new THREE.Vector3(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+        piles.push(projectToSurface(BASE_POSITION.clone().add(offset)));
+      }
+    }
+    return piles;
+  }, []);
+
   const [trees, setTrees] = useState<Tree[]>(() => 
     Array.from({ length: TREE_COUNT }, (_, i) => ({
       id: `tree-${i}`,
@@ -79,7 +122,6 @@ const World: React.FC<WorldProps> = ({
 
   const [ghostPos, setGhostPos] = useState<THREE.Vector3 | null>(null);
 
-  // --- Interaction Logic ---
   const handlePlanetClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
     if (isPlacementMode && ghostPos && placementType) {
@@ -114,19 +156,31 @@ const World: React.FC<WorldProps> = ({
 
   const handleEntityClick = (id: string, type: 'TREE' | 'BUILDING') => (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-    if (selectedFollowerId) {
-      setFollowers(prev => prev.map(f => {
-        if (f.id === selectedFollowerId) {
-          return {
-            ...f,
-            state: type === 'TREE' ? AgentState.GATHER : AgentState.BUILD,
-            targetId: id,
-            targetPos: null
-          };
+    const selected = followers.find(f => f.id === selectedFollowerId);
+    if (!selected) return;
+
+    if (type === 'BUILDING') {
+      const targetBuilding = buildings.find(b => b.id === id);
+      if (targetBuilding?.type === 'TOWER' && targetBuilding.isComplete && selected.role === FollowerRole.WARRIOR) {
+        if (targetBuilding.assignedWorkers.length < TOWER_CAPACITY) {
+          setFollowers(prev => prev.map(f => f.id === selectedFollowerId ? { ...f, state: AgentState.GUARD, targetId: id, targetPos: null } : f));
+          setBuildings(prev => prev.map(b => b.id === id ? { ...b, assignedWorkers: [...b.assignedWorkers, selected.id] } : b));
+          return;
         }
-        return f;
-      }));
+      }
     }
+
+    setFollowers(prev => prev.map(f => {
+      if (f.id === selectedFollowerId) {
+        return {
+          ...f,
+          state: type === 'TREE' ? AgentState.GATHER : AgentState.BUILD,
+          targetId: id,
+          targetPos: null
+        };
+      }
+      return f;
+    }));
   };
 
   const handleFollowerClick = (id: string) => (e: ThreeEvent<MouseEvent>) => {
@@ -134,8 +188,8 @@ const World: React.FC<WorldProps> = ({
     setSelectedFollowerId(id);
   };
 
-  // --- Simulation Loop ---
   useFrame((state, delta) => {
+    // 1. Follower Simulation
     setFollowers(currentFollowers => {
       let changed = false;
       const nextFollowers = currentFollowers.map(f => {
@@ -143,23 +197,25 @@ const World: React.FC<WorldProps> = ({
         let nextState = f.state;
         let nextRole = f.role;
         let nextTargetPos = f.targetPos;
+        let nextTargetId = f.targetId;
         let nextWood = f.woodCarrying;
 
-        // WANDER: Return to base and patrol
         if (nextState === AgentState.WANDER) {
           const distToBase = nextPos.distanceTo(BASE_POSITION);
           if (distToBase > 6) {
             nextPos = moveOnSphere(nextPos, BASE_POSITION, AGENT_SPEED * delta * 10);
           } else {
-            if (!nextTargetPos || nextPos.distanceTo(nextTargetPos) < 1) {
-              const offset = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).multiplyScalar(5);
+            if (!nextTargetPos || nextPos.distanceTo(nextTargetPos) < 0.5) {
+              const patrolRadius = 4;
+              const angle = Math.random() * Math.PI * 2;
+              const dist = Math.random() * patrolRadius;
+              const offset = new THREE.Vector3(Math.cos(angle) * dist, 0, Math.sin(angle) * dist);
               nextTargetPos = projectToSurface(BASE_POSITION.clone().add(offset));
             }
-            nextPos = moveOnSphere(nextPos, nextTargetPos, AGENT_SPEED * delta * 5);
+            nextPos = moveOnSphere(nextPos, nextTargetPos, AGENT_SPEED * delta * 3);
           }
         }
 
-        // MOVE
         if (nextState === AgentState.MOVE && nextTargetPos) {
           nextPos = moveOnSphere(nextPos, nextTargetPos, AGENT_SPEED * delta * 15);
           if (nextPos.distanceTo(nextTargetPos) < 0.5) {
@@ -168,24 +224,23 @@ const World: React.FC<WorldProps> = ({
           }
         }
 
-        // GATHER
-        if (nextState === AgentState.GATHER && f.targetId) {
-          const targetTree = trees.find(t => t.id === f.targetId);
+        if (nextState === AgentState.GATHER && nextTargetId) {
+          const targetTree = trees.find(t => t.id === nextTargetId);
           if (targetTree && targetTree.health > 0) {
             const dist = nextPos.distanceTo(targetTree.position);
             if (dist > INTERACTION_RANGE) {
               nextPos = moveOnSphere(nextPos, targetTree.position, AGENT_SPEED * delta * 15);
             } else {
-              setTrees(prev => prev.map(t => t.id === f.targetId ? { ...t, health: Math.max(0, t.health - CHOP_STRENGTH) } : t));
+              setTrees(prev => prev.map(t => t.id === nextTargetId ? { ...t, health: Math.max(0, t.health - CHOP_STRENGTH) } : t));
               nextWood += CHOP_STRENGTH;
               if (nextWood >= WOOD_CAPACITY) nextState = AgentState.DELIVER;
             }
           } else {
             nextState = nextWood > 0 ? AgentState.DELIVER : AgentState.WANDER;
+            if (nextState === AgentState.WANDER) nextTargetId = null;
           }
         }
 
-        // DELIVER
         if (nextState === AgentState.DELIVER) {
           const dist = nextPos.distanceTo(BASE_POSITION);
           if (dist > INTERACTION_RANGE) {
@@ -193,62 +248,134 @@ const World: React.FC<WorldProps> = ({
           } else {
             setWood(prev => prev + nextWood);
             nextWood = 0;
-            if (f.targetId && trees.find(t => t.id === f.targetId)) nextState = AgentState.GATHER;
-            else nextState = AgentState.WANDER;
+            nextState = AgentState.WANDER;
+            nextTargetId = null;
+            nextTargetPos = null;
           }
         }
 
-        // BUILD
-        if (nextState === AgentState.BUILD && f.targetId) {
-          const targetBuilding = buildings.find(b => b.id === f.targetId);
+        if (nextState === AgentState.BUILD && nextTargetId) {
+          const targetBuilding = buildings.find(b => b.id === nextTargetId);
           if (targetBuilding && !targetBuilding.isComplete) {
             const dist = nextPos.distanceTo(targetBuilding.position);
             if (dist > INTERACTION_RANGE) {
               nextPos = moveOnSphere(nextPos, targetBuilding.position, AGENT_SPEED * delta * 15);
             } else {
               setBuildings(prev => prev.map(b => {
-                if (b.id === f.targetId) {
+                if (b.id === nextTargetId) {
                   const newProgress = Math.min(100, b.progress + BUILD_STRENGTH);
                   return { ...b, progress: newProgress, isComplete: newProgress >= 100 };
                 }
                 return b;
               }));
             }
-          } else if (targetBuilding?.isComplete && targetBuilding.type === 'WARRIOR_HUT') {
-              // Automatically start training if assigned to a completed warrior hut
+          } else if (targetBuilding?.isComplete && targetBuilding.type === 'WARRIOR_HUT' && nextRole === FollowerRole.WORKER) {
               nextState = AgentState.TRAIN;
           } else {
             nextState = AgentState.WANDER;
+            nextTargetId = null;
           }
         }
 
-        // TRAIN: Role change at warrior hut
-        if (nextState === AgentState.TRAIN && f.targetId) {
-            const targetBuilding = buildings.find(b => b.id === f.targetId);
+        if (nextState === AgentState.TRAIN && nextTargetId) {
+            const targetBuilding = buildings.find(b => b.id === nextTargetId);
             if (targetBuilding?.isComplete) {
                 const dist = nextPos.distanceTo(targetBuilding.position);
                 if (dist > INTERACTION_RANGE) {
                     nextPos = moveOnSphere(nextPos, targetBuilding.position, AGENT_SPEED * delta * 15);
                 } else {
-                    // Logic to turn worker into warrior
-                    if (nextRole === FollowerRole.WORKER) {
-                        nextRole = FollowerRole.WARRIOR;
-                    }
+                    if (nextRole === FollowerRole.WORKER) nextRole = FollowerRole.WARRIOR;
                     nextState = AgentState.WANDER;
+                    nextTargetId = null;
                 }
             } else {
                 nextState = AgentState.WANDER;
+                nextTargetId = null;
             }
         }
 
-        if (!nextPos.equals(f.position) || nextState !== f.state || nextRole !== f.role) changed = true;
-        return { ...f, position: nextPos, state: nextState, role: nextRole, targetPos: nextTargetPos, woodCarrying: nextWood };
-      });
+        if (nextState === AgentState.GUARD && nextTargetId) {
+          const tower = buildings.find(b => b.id === nextTargetId);
+          if (tower) {
+            const dist = nextPos.distanceTo(tower.position);
+            if (dist > 0.1) {
+              nextPos = moveOnSphere(nextPos, tower.position, AGENT_SPEED * delta * 15);
+            }
+            // Logic for shooting is handled in the tower loop
+          } else {
+            nextState = AgentState.WANDER;
+            nextTargetId = null;
+          }
+        }
 
+        if (!nextPos.equals(f.position) || nextState !== f.state || nextRole !== f.role || nextTargetId !== f.targetId) changed = true;
+        return { ...f, position: nextPos, state: nextState, role: nextRole, targetPos: nextTargetPos, targetId: nextTargetId, woodCarrying: nextWood };
+      });
       return changed ? nextFollowers : currentFollowers;
     });
 
-    // Population Growth
+    // 2. Tower Combat Logic
+    buildings.filter(b => b.type === 'TOWER' && b.isComplete).forEach(tower => {
+      const guards = followers.filter(f => f.state === AgentState.GUARD && f.targetId === tower.id);
+      if (guards.length > 0) {
+        if (!towerFireTimers.current[tower.id]) towerFireTimers.current[tower.id] = 0;
+        towerFireTimers.current[tower.id] += delta;
+
+        if (towerFireTimers.current[tower.id] >= FIRE_RATE) {
+          const nearestEnemy = enemies.find(e => e.position.distanceTo(tower.position) < TOWER_RANGE);
+          if (nearestEnemy) {
+            towerFireTimers.current[tower.id] = 0;
+            const startPos = tower.position.clone().add(new THREE.Vector3(0, 7, 0).applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), tower.position.clone().normalize())));
+            const dir = nearestEnemy.position.clone().sub(startPos).normalize();
+            setProjectiles(prev => [...prev, {
+              id: `arrow-${Date.now()}`,
+              position: startPos,
+              targetId: nearestEnemy.id,
+              velocity: dir.multiplyScalar(PROJECTILE_SPEED)
+            }]);
+          }
+        }
+      }
+    });
+
+    // 3. Enemy Simulation
+    enemySpawnTimer.current += delta;
+    if (enemySpawnTimer.current > 15) { // Spawn enemy every 15 seconds
+      enemySpawnTimer.current = 0;
+      const spawnPos = getRandomSurfacePos();
+      setEnemies(prev => [...prev, {
+        id: `enemy-${Date.now()}`,
+        position: spawnPos,
+        health: 100,
+        targetPos: BASE_POSITION.clone()
+      }]);
+    }
+
+    setEnemies(currentEnemies => {
+      return currentEnemies.map(e => {
+        const nextPos = moveOnSphere(e.position, e.targetPos, AGENT_SPEED * delta * 6);
+        return { ...e, position: nextPos };
+      }).filter(e => e.health > 0 && e.position.distanceTo(BASE_POSITION) > 1);
+    });
+
+    // 4. Projectile Simulation
+    setProjectiles(prev => {
+      const next: Projectile[] = [];
+      prev.forEach(p => {
+        const enemy = enemies.find(e => e.id === p.targetId);
+        if (enemy) {
+          const nextPos = p.position.clone().add(p.velocity);
+          if (nextPos.distanceTo(enemy.position) < 1.0) {
+            setEnemies(es => es.map(e => e.id === p.targetId ? { ...e, health: e.health - 50 } : e));
+          } else {
+            next.push({ ...p, position: nextPos });
+          }
+        }
+      });
+      return next;
+    });
+
+    // 5. Cleanup and Growth
     const completedHuts = buildings.filter(b => b.isComplete && b.type === 'HUT').length;
     const maxPop = 5 + (completedHuts * 3);
     if (followers.length < maxPop && completedHuts > 0) {
@@ -269,7 +396,6 @@ const World: React.FC<WorldProps> = ({
         }
       }
     }
-
     setTrees(prev => prev.filter(t => t.health > 0));
   });
 
@@ -278,6 +404,8 @@ const World: React.FC<WorldProps> = ({
     setMaxPopulation(5 + completedHuts * 3);
     setPopulation(followers.length);
   }, [buildings, followers.length]);
+
+  const visibleWoodPiles = Math.min(woodPilePositions.length, Math.floor(wood / 25));
 
   return (
     <group>
@@ -288,7 +416,6 @@ const World: React.FC<WorldProps> = ({
         <meshStandardMaterial color="#2d4a22" roughness={0.9} flatShading />
       </Sphere>
 
-      {/* Tribe Home Flag */}
       <SurfaceAligned position={BASE_POSITION}>
         <group>
           <Float speed={2} rotationIntensity={0.5} floatIntensity={0.5}>
@@ -307,6 +434,10 @@ const World: React.FC<WorldProps> = ({
           </Ring>
         </group>
       </SurfaceAligned>
+
+      {woodPilePositions.slice(0, visibleWoodPiles).map((pos, i) => (
+        <FirewoodPile key={`wood-pile-${i}`} position={pos} seed={i} />
+      ))}
 
       {trees.map(tree => (
         <SurfaceAligned key={tree.id} position={tree.position}>
@@ -333,7 +464,6 @@ const World: React.FC<WorldProps> = ({
       {buildings.map(building => (
         <SurfaceAligned key={building.id} position={building.position}>
           <group onClick={handleEntityClick(building.id, 'BUILDING')} scale={building.isComplete ? 1 : 0.6 + (building.progress / 250)}>
-            {/* Building Specific Geometry */}
             {building.type === 'HUT' && (
               <>
                 <Box args={[3, 2, 3]} position={[0, 1, 0]}>
@@ -402,6 +532,14 @@ const World: React.FC<WorldProps> = ({
                 </div>
               </Html>
             )}
+            
+            {building.type === 'TOWER' && building.isComplete && (
+              <Html distanceFactor={8} position={[0, 8, 0]}>
+                <div className="text-[8px] bg-black/50 px-2 py-0.5 rounded text-white/50 border border-white/10 uppercase font-bold">
+                  GARRISON {building.assignedWorkers.length} / {TOWER_CAPACITY}
+                </div>
+              </Html>
+            )}
           </group>
         </SurfaceAligned>
       ))}
@@ -413,17 +551,55 @@ const World: React.FC<WorldProps> = ({
             : null;
         const isCloseEnough = targetEntity && follower.position.distanceTo(targetEntity.position) <= INTERACTION_RANGE + 1.0;
         
+        // If guarding, calculate the visual height offset for the tower platform
+        const tower = follower.state === AgentState.GUARD ? buildings.find(b => b.id === follower.targetId) : null;
+        const isAtTower = tower && follower.position.distanceTo(tower.position) < 0.2;
+        const visualHeight = isAtTower ? 7.2 : 0;
+        const towerGuardOffset = isAtTower ? (tower.assignedWorkers.indexOf(follower.id) === 0 ? 0.6 : -0.6) : 0;
+
         return (
-          <SurfaceAligned key={follower.id} position={follower.position}>
-            <FollowerMesh 
-              follower={follower} 
-              isSelected={selectedFollowerId === follower.id} 
-              isAnimating={isInteracting && isCloseEnough}
-              onClick={handleFollowerClick(follower.id)}
-            />
-          </SurfaceAligned>
+          <group key={follower.id} position={new THREE.Vector3(0, visualHeight, 0).applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), follower.position.clone().normalize()))}>
+             <SurfaceAligned position={follower.position}>
+               <group position={[towerGuardOffset, 0, 0]}>
+                  <FollowerMesh 
+                    follower={follower} 
+                    isSelected={selectedFollowerId === follower.id} 
+                    isAnimating={isInteracting && isCloseEnough}
+                    onClick={handleFollowerClick(follower.id)}
+                  />
+               </group>
+            </SurfaceAligned>
+          </group>
         );
       })}
+
+      {/* Enemies */}
+      {enemies.map(enemy => (
+        <SurfaceAligned key={enemy.id} position={enemy.position}>
+          <group scale={0.8}>
+            <Box args={[0.7, 1, 0.5]} position={[0, 0.5, 0]}>
+              <meshStandardMaterial color="#800" />
+            </Box>
+            <Sphere args={[0.3]} position={[0, 1.2, 0]}>
+               <meshStandardMaterial color="#222" />
+            </Sphere>
+            <Html distanceFactor={10} position={[0, 2, 0]}>
+               <div className="w-10 h-1 bg-black/60 rounded-full overflow-hidden">
+                 <div className="h-full bg-red-500" style={{ width: `${enemy.health}%` }} />
+               </div>
+            </Html>
+          </group>
+        </SurfaceAligned>
+      ))}
+
+      {/* Projectiles (Arrows) */}
+      {projectiles.map(proj => (
+        <group key={proj.id} position={proj.position}>
+           <Box args={[0.1, 0.1, 0.6]}>
+              <meshBasicMaterial color="#ffea00" />
+           </Box>
+        </group>
+      ))}
 
       {isPlacementMode && ghostPos && (
         <SurfaceAligned position={ghostPos}>
@@ -481,17 +657,14 @@ const FollowerMesh: React.FC<FollowerMeshProps> = ({ follower, isSelected, isAni
     <group onClick={onClick}>
       <group ref={groupRef}>
         <Float speed={5} rotationIntensity={0.4} floatIntensity={0.25}>
-          {/* Main Body */}
           <Box args={[0.7, follower.role === FollowerRole.SHAMAN ? 1.4 : 1, 0.5]} position={[0, follower.role === FollowerRole.SHAMAN ? 0.7 : 0.5, 0]}>
             <meshStandardMaterial color={getRoleColor()} />
           </Box>
           
-          {/* Head */}
           <Sphere args={[follower.role === FollowerRole.SHAMAN ? 0.4 : 0.35]} position={[0, follower.role === FollowerRole.SHAMAN ? 1.6 : 1.2, 0]}>
             <meshStandardMaterial color={follower.role === FollowerRole.WARRIOR ? "#333" : "#fefae0"} />
           </Sphere>
           
-          {/* Warrior Horns / Decoration */}
           {follower.role === FollowerRole.WARRIOR && (
             <group position={[0, 1.2, 0]}>
                <Cone args={[0.1, 0.4, 4]} position={[0.25, 0.3, 0]} rotation={[0.4, 0, -0.4]}>
@@ -503,12 +676,10 @@ const FollowerMesh: React.FC<FollowerMeshProps> = ({ follower, isSelected, isAni
             </group>
           )}
 
-          {/* Shaman Glow */}
           {follower.role === FollowerRole.SHAMAN && (
              <pointLight intensity={0.5} distance={3} color="#bc4ed8" />
           )}
           
-          {/* Wood visual stack */}
           {follower.woodCarrying > 0 && (
              <Box args={[0.9, 0.3, 0.4]} position={[0, 0.15, 0.3]}>
                 <meshStandardMaterial color="#4a3728" />
@@ -517,7 +688,6 @@ const FollowerMesh: React.FC<FollowerMeshProps> = ({ follower, isSelected, isAni
         </Float>
       </group>
       
-      {/* Selection Ring */}
       {isSelected && (
         <group position={[0, 0.1, 0]}>
           <Torus args={[1.2, 0.05, 16, 100]} rotation={[Math.PI / 2, 0, 0]}>
