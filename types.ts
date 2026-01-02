@@ -6,7 +6,17 @@ export enum AgentState {
   MOVE = 'MOVE',
   GATHER = 'GATHER',
   BUILD = 'BUILD',
-  WANDER = 'WANDER'
+  WANDER = 'WANDER',
+  DELIVER = 'DELIVER',
+  TRAIN = 'TRAIN'
+}
+
+export type BuildingType = 'HUT' | 'WARRIOR_HUT' | 'TOWER' | 'TEMPLE';
+
+export enum FollowerRole {
+  WORKER = 'WORKER',
+  WARRIOR = 'WARRIOR',
+  SHAMAN = 'SHAMAN'
 }
 
 export interface SphericalPos {
@@ -25,7 +35,7 @@ export interface Tree extends Entity {
 }
 
 export interface Building extends Entity {
-  type: 'HUT';
+  type: BuildingType;
   progress: number; // 0 to 100
   isComplete: boolean;
   assignedWorkers: string[];
@@ -33,9 +43,11 @@ export interface Building extends Entity {
 
 export interface Follower extends Entity {
   state: AgentState;
+  role: FollowerRole;
   targetId: string | null;
   targetPos: Vector3 | null;
   woodCarrying: number;
+  isShaman?: boolean; // Kept for backwards compatibility if needed, but role is preferred
 }
 
 export interface GameState {

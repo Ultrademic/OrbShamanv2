@@ -1,7 +1,7 @@
 
 import React, { useRef, useState, useMemo } from 'react';
 import { useFrame, ThreeEvent } from '@react-three/fiber';
-import { Sphere, Box, Cone, Cylinder, Trail, Float, Html } from '@react-three/drei';
+import { Sphere, Box, Cone, Cylinder, Ring, Float, Html, Torus } from '@react-three/drei';
 import * as THREE from 'three';
 import { 
   PLANET_RADIUS, 
@@ -11,9 +11,11 @@ import {
   BUILD_STRENGTH, 
   AGENT_SPEED, 
   INTERACTION_RANGE,
-  HUT_COST
+  GROWTH_RATE,
+  BASE_POSITION,
+  WOOD_CAPACITY
 } from '../constants';
-import { AgentState, Tree, Building, Follower } from '../types';
+import { AgentState, Tree, Building, Follower, BuildingType, FollowerRole } from '../types';
 import { getRandomSurfacePos, projectToSurface, moveOnSphere } from '../utils';
 
 // Helper component to align its children to the surface normal
@@ -36,6 +38,7 @@ interface WorldProps {
   setPopulation: React.Dispatch<React.SetStateAction<number>>;
   setMaxPopulation: React.Dispatch<React.SetStateAction<number>>;
   isPlacementMode: boolean;
+  placementType: BuildingType | null;
   onPlacedBuilding: () => void;
 }
 
@@ -45,9 +48,12 @@ const World: React.FC<WorldProps> = ({
   setPopulation, 
   setMaxPopulation,
   isPlacementMode,
+  placementType,
   onPlacedBuilding 
 }) => {
-  // --- Game State ---
+  const growthTimer = useRef(0);
+  const [selectedFollowerId, setSelectedFollowerId] = useState<string | null>(null);
+  
   const [trees, setTrees] = useState<Tree[]>(() => 
     Array.from({ length: TREE_COUNT }, (_, i) => ({
       id: `tree-${i}`,
@@ -64,6 +70,7 @@ const World: React.FC<WorldProps> = ({
       id: `follower-${i}`,
       position: getRandomSurfacePos(),
       state: AgentState.WANDER,
+      role: i === 0 ? FollowerRole.SHAMAN : FollowerRole.WORKER,
       targetId: null,
       targetPos: null,
       woodCarrying: 0
@@ -75,11 +82,11 @@ const World: React.FC<WorldProps> = ({
   // --- Interaction Logic ---
   const handlePlanetClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-    if (isPlacementMode && ghostPos) {
+    if (isPlacementMode && ghostPos && placementType) {
       setBuildings(prev => [...prev, {
         id: `building-${Date.now()}`,
         position: ghostPos.clone(),
-        type: 'HUT',
+        type: placementType,
         progress: 0,
         isComplete: false,
         assignedWorkers: []
@@ -88,13 +95,15 @@ const World: React.FC<WorldProps> = ({
       return;
     }
 
-    const point = e.point.clone();
-    setFollowers(prev => prev.map(f => ({
-      ...f,
-      state: AgentState.MOVE,
-      targetPos: projectToSurface(point),
-      targetId: null
-    })));
+    if (selectedFollowerId) {
+      const point = projectToSurface(e.point.clone());
+      setFollowers(prev => prev.map(f => {
+        if (f.id === selectedFollowerId) {
+          return { ...f, state: AgentState.MOVE, targetPos: point, targetId: null };
+        }
+        return f;
+      }));
+    }
   };
 
   const handlePointerMove = (e: ThreeEvent<PointerEvent>) => {
@@ -105,31 +114,52 @@ const World: React.FC<WorldProps> = ({
 
   const handleEntityClick = (id: string, type: 'TREE' | 'BUILDING') => (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-    setFollowers(prev => prev.map(f => ({
-      ...f,
-      state: type === 'TREE' ? AgentState.GATHER : AgentState.BUILD,
-      targetId: id,
-      targetPos: null
-    })));
+    if (selectedFollowerId) {
+      setFollowers(prev => prev.map(f => {
+        if (f.id === selectedFollowerId) {
+          return {
+            ...f,
+            state: type === 'TREE' ? AgentState.GATHER : AgentState.BUILD,
+            targetId: id,
+            targetPos: null
+          };
+        }
+        return f;
+      }));
+    }
+  };
+
+  const handleFollowerClick = (id: string) => (e: ThreeEvent<MouseEvent>) => {
+    e.stopPropagation();
+    setSelectedFollowerId(id);
   };
 
   // --- Simulation Loop ---
-  useFrame((_state, delta) => {
+  useFrame((state, delta) => {
     setFollowers(currentFollowers => {
       let changed = false;
       const nextFollowers = currentFollowers.map(f => {
         let nextPos = f.position.clone();
         let nextState = f.state;
+        let nextRole = f.role;
         let nextTargetPos = f.targetPos;
         let nextWood = f.woodCarrying;
 
+        // WANDER: Return to base and patrol
         if (nextState === AgentState.WANDER) {
-          if (!nextTargetPos || nextPos.distanceTo(nextTargetPos) < 1) {
-            nextTargetPos = getRandomSurfacePos();
+          const distToBase = nextPos.distanceTo(BASE_POSITION);
+          if (distToBase > 6) {
+            nextPos = moveOnSphere(nextPos, BASE_POSITION, AGENT_SPEED * delta * 10);
+          } else {
+            if (!nextTargetPos || nextPos.distanceTo(nextTargetPos) < 1) {
+              const offset = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).multiplyScalar(5);
+              nextTargetPos = projectToSurface(BASE_POSITION.clone().add(offset));
+            }
+            nextPos = moveOnSphere(nextPos, nextTargetPos, AGENT_SPEED * delta * 5);
           }
-          nextPos = moveOnSphere(nextPos, nextTargetPos, AGENT_SPEED * delta * 5);
         }
 
+        // MOVE
         if (nextState === AgentState.MOVE && nextTargetPos) {
           nextPos = moveOnSphere(nextPos, nextTargetPos, AGENT_SPEED * delta * 15);
           if (nextPos.distanceTo(nextTargetPos) < 0.5) {
@@ -138,6 +168,7 @@ const World: React.FC<WorldProps> = ({
           }
         }
 
+        // GATHER
         if (nextState === AgentState.GATHER && f.targetId) {
           const targetTree = trees.find(t => t.id === f.targetId);
           if (targetTree && targetTree.health > 0) {
@@ -147,16 +178,27 @@ const World: React.FC<WorldProps> = ({
             } else {
               setTrees(prev => prev.map(t => t.id === f.targetId ? { ...t, health: Math.max(0, t.health - CHOP_STRENGTH) } : t));
               nextWood += CHOP_STRENGTH;
-              if (nextWood >= 20) {
-                setWood(prev => prev + nextWood);
-                nextWood = 0;
-              }
+              if (nextWood >= WOOD_CAPACITY) nextState = AgentState.DELIVER;
             }
           } else {
-            nextState = AgentState.WANDER;
+            nextState = nextWood > 0 ? AgentState.DELIVER : AgentState.WANDER;
           }
         }
 
+        // DELIVER
+        if (nextState === AgentState.DELIVER) {
+          const dist = nextPos.distanceTo(BASE_POSITION);
+          if (dist > INTERACTION_RANGE) {
+            nextPos = moveOnSphere(nextPos, BASE_POSITION, AGENT_SPEED * delta * 15);
+          } else {
+            setWood(prev => prev + nextWood);
+            nextWood = 0;
+            if (f.targetId && trees.find(t => t.id === f.targetId)) nextState = AgentState.GATHER;
+            else nextState = AgentState.WANDER;
+          }
+        }
+
+        // BUILD
         if (nextState === AgentState.BUILD && f.targetId) {
           const targetBuilding = buildings.find(b => b.id === f.targetId);
           if (targetBuilding && !targetBuilding.isComplete) {
@@ -172,74 +214,115 @@ const World: React.FC<WorldProps> = ({
                 return b;
               }));
             }
+          } else if (targetBuilding?.isComplete && targetBuilding.type === 'WARRIOR_HUT') {
+              // Automatically start training if assigned to a completed warrior hut
+              nextState = AgentState.TRAIN;
           } else {
             nextState = AgentState.WANDER;
           }
         }
 
-        if (!nextPos.equals(f.position) || nextState !== f.state) changed = true;
-        return { ...f, position: nextPos, state: nextState, targetPos: nextTargetPos, woodCarrying: nextWood };
+        // TRAIN: Role change at warrior hut
+        if (nextState === AgentState.TRAIN && f.targetId) {
+            const targetBuilding = buildings.find(b => b.id === f.targetId);
+            if (targetBuilding?.isComplete) {
+                const dist = nextPos.distanceTo(targetBuilding.position);
+                if (dist > INTERACTION_RANGE) {
+                    nextPos = moveOnSphere(nextPos, targetBuilding.position, AGENT_SPEED * delta * 15);
+                } else {
+                    // Logic to turn worker into warrior
+                    if (nextRole === FollowerRole.WORKER) {
+                        nextRole = FollowerRole.WARRIOR;
+                    }
+                    nextState = AgentState.WANDER;
+                }
+            } else {
+                nextState = AgentState.WANDER;
+            }
+        }
+
+        if (!nextPos.equals(f.position) || nextState !== f.state || nextRole !== f.role) changed = true;
+        return { ...f, position: nextPos, state: nextState, role: nextRole, targetPos: nextTargetPos, woodCarrying: nextWood };
       });
 
       return changed ? nextFollowers : currentFollowers;
     });
 
-    setTrees(prev => {
-      const remaining = prev.filter(t => t.health > 0);
-      return remaining.length !== prev.length ? remaining : prev;
-    });
+    // Population Growth
+    const completedHuts = buildings.filter(b => b.isComplete && b.type === 'HUT').length;
+    const maxPop = 5 + (completedHuts * 3);
+    if (followers.length < maxPop && completedHuts > 0) {
+      growthTimer.current += delta * GROWTH_RATE * completedHuts;
+      if (growthTimer.current >= 1) {
+        growthTimer.current = 0;
+        const parentHut = buildings.find(b => b.isComplete && b.type === 'HUT');
+        if (parentHut) {
+          setFollowers(prev => [...prev, {
+            id: `follower-${Date.now()}`,
+            position: parentHut.position.clone(),
+            state: AgentState.WANDER,
+            role: FollowerRole.WORKER,
+            targetId: null,
+            targetPos: getRandomSurfacePos(),
+            woodCarrying: 0
+          }]);
+        }
+      }
+    }
+
+    setTrees(prev => prev.filter(t => t.health > 0));
   });
 
   useMemo(() => {
-    const completedHuts = buildings.filter(b => b.isComplete).length;
+    const completedHuts = buildings.filter(b => b.isComplete && b.type === 'HUT').length;
     setMaxPopulation(5 + completedHuts * 3);
     setPopulation(followers.length);
-  }, [buildings, followers.length, setMaxPopulation, setPopulation]);
+  }, [buildings, followers.length]);
 
   return (
     <group>
-      <ambientLight intensity={0.4} />
-      <directionalLight position={[10, 10, 10]} intensity={1.5} castShadow />
-      <pointLight position={[-10, -10, -10]} intensity={0.5} color="#44a" />
-
-      <Sphere 
-        args={[PLANET_RADIUS, 64, 64]} 
-        onPointerMove={handlePointerMove}
-        onClick={handlePlanetClick}
-      >
-        <meshStandardMaterial 
-          color="#3a5a40" 
-          roughness={0.8} 
-          metalness={0.1}
-          flatShading={true}
-        />
+      <ambientLight intensity={0.5} />
+      <directionalLight position={[20, 30, 10]} intensity={1.8} castShadow />
+      
+      <Sphere args={[PLANET_RADIUS, 64, 64]} onPointerMove={handlePointerMove} onClick={handlePlanetClick}>
+        <meshStandardMaterial color="#2d4a22" roughness={0.9} flatShading />
       </Sphere>
 
-      <Sphere args={[PLANET_RADIUS - 0.2, 64, 64]}>
-        <meshStandardMaterial color="#0077be" transparent opacity={0.3} />
-      </Sphere>
+      {/* Tribe Home Flag */}
+      <SurfaceAligned position={BASE_POSITION}>
+        <group>
+          <Float speed={2} rotationIntensity={0.5} floatIntensity={0.5}>
+            <Cylinder args={[0.12, 0.12, 8, 8]} position={[0, 4, 0]}>
+              <meshStandardMaterial color="#333" />
+            </Cylinder>
+            <Box args={[3.5, 2.2, 0.1]} position={[1.75, 7, 0]}>
+              <meshStandardMaterial color="#7b2cbf" emissive="#3c096c" emissiveIntensity={0.6} />
+            </Box>
+            <Torus args={[0.5, 0.1, 16, 100]} position={[0, 8.5, 0]} rotation={[Math.PI/2, 0, 0]}>
+               <meshStandardMaterial color="#ffea00" emissive="#ffea00" />
+            </Torus>
+          </Float>
+          <Ring args={[3.2, 3.5, 48]} rotation={[-Math.PI/2, 0, 0]} position={[0, 0.1, 0]}>
+             <meshBasicMaterial color="#ffea00" transparent opacity={0.2} />
+          </Ring>
+        </group>
+      </SurfaceAligned>
 
-      {/* Trees */}
       {trees.map(tree => (
         <SurfaceAligned key={tree.id} position={tree.position}>
           <group onClick={handleEntityClick(tree.id, 'TREE')}>
-            <Float speed={2} rotationIntensity={0.2} floatIntensity={0.5}>
-              {/* Leaves: height 2, pivot at bottom of cone would be [0, 1.5, 0] */}
-              <Cone args={[0.6, 2, 8]} position={[0, 1.5, 0]}>
-                <meshStandardMaterial color="#386641" />
+            <Float speed={2} rotationIntensity={0.1} floatIntensity={0.2}>
+              <Cone args={[0.6, 2.2, 8]} position={[0, 1.6, 0]}>
+                <meshStandardMaterial color="#1b4332" />
               </Cone>
-              {/* Trunk: height 1, pivot at center. So [0, 0.5, 0] puts base at 0 */}
-              <Cylinder args={[0.2, 0.2, 1, 8]} position={[0, 0.5, 0]}>
-                <meshStandardMaterial color="#604a32" />
+              <Cylinder args={[0.2, 0.25, 1, 8]} position={[0, 0.5, 0]}>
+                <meshStandardMaterial color="#3d2b1f" />
               </Cylinder>
             </Float>
             {tree.health < 100 && (
-              <Html distanceFactor={10} position={[0, 3, 0]}>
-                <div className="w-12 h-1.5 bg-black/50 border border-white/20 rounded-full overflow-hidden">
-                  <div 
-                    className="h-full bg-green-500 transition-all duration-300" 
-                    style={{ width: `${tree.health}%` }} 
-                  />
+              <Html distanceFactor={10} position={[0, 3.5, 0]}>
+                <div className="w-16 h-1.5 bg-black/50 border border-white/20 rounded-full overflow-hidden">
+                  <div className="h-full bg-emerald-500 transition-all duration-300 shadow-[0_0_8px_#10b981]" style={{ width: `${(tree.health / tree.maxHealth) * 100}%` }} />
                 </div>
               </Html>
             )}
@@ -247,33 +330,74 @@ const World: React.FC<WorldProps> = ({
         </SurfaceAligned>
       ))}
 
-      {/* Buildings */}
       {buildings.map(building => (
         <SurfaceAligned key={building.id} position={building.position}>
-          <group 
-            onClick={handleEntityClick(building.id, 'BUILDING')}
-            scale={building.isComplete ? 1 : 0.5 + (building.progress / 200)}
-          >
-            {/* Base Box: height 2, pivot at center. So [0, 1, 0] puts base at 0 */}
-            <Box args={[3, 2, 3]} position={[0, 1, 0]}>
-              <meshStandardMaterial color={building.isComplete ? "#bc6c25" : "#8d99ae"} />
-            </Box>
-            {/* Roof: height 2, sits on top of box. So [0, 3, 0] */}
-            <Cone args={[2.5, 2, 4]} position={[0, 3, 0]} rotation={[0, Math.PI / 4, 0]}>
-              <meshStandardMaterial color="#606c38" />
-            </Cone>
-            
+          <group onClick={handleEntityClick(building.id, 'BUILDING')} scale={building.isComplete ? 1 : 0.6 + (building.progress / 250)}>
+            {/* Building Specific Geometry */}
+            {building.type === 'HUT' && (
+              <>
+                <Box args={[3, 2, 3]} position={[0, 1, 0]}>
+                  <meshStandardMaterial color={building.isComplete ? "#bc6c25" : "#4a4e69"} />
+                </Box>
+                <Cone args={[2.5, 2, 4]} position={[0, 3, 0]} rotation={[0, Math.PI / 4, 0]}>
+                  <meshStandardMaterial color="#606c38" />
+                </Cone>
+              </>
+            )}
+
+            {building.type === 'WARRIOR_HUT' && (
+              <>
+                <Box args={[4, 1.5, 4]} position={[0, 0.75, 0]}>
+                  <meshStandardMaterial color={building.isComplete ? "#641212" : "#333"} />
+                </Box>
+                <Cylinder args={[2, 2.2, 3, 4]} position={[0, 3, 0]} rotation={[0, Math.PI / 4, 0]}>
+                   <meshStandardMaterial color="#4a4a4a" />
+                </Cylinder>
+                <Cone args={[0.5, 2, 4]} position={[1.5, 4.5, 1.5]} rotation={[0, Math.PI/4, 0]}>
+                   <meshStandardMaterial color="#941b1b" />
+                </Cone>
+                <Cone args={[0.5, 2, 4]} position={[-1.5, 4.5, -1.5]} rotation={[0, Math.PI/4, 0]}>
+                   <meshStandardMaterial color="#941b1b" />
+                </Cone>
+              </>
+            )}
+
+            {building.type === 'TOWER' && (
+              <>
+                <Cylinder args={[1.5, 1.8, 6, 8]} position={[0, 3, 0]}>
+                  <meshStandardMaterial color={building.isComplete ? "#555" : "#333"} />
+                </Cylinder>
+                <Box args={[2.5, 1, 2.5]} position={[0, 6.5, 0]}>
+                  <meshStandardMaterial color="#777" />
+                </Box>
+              </>
+            )}
+
+            {building.type === 'TEMPLE' && (
+              <>
+                <Box args={[6, 1, 6]} position={[0, 0.5, 0]}>
+                   <meshStandardMaterial color="#222" />
+                </Box>
+                <Box args={[4, 2, 4]} position={[0, 2, 0]}>
+                   <meshStandardMaterial color="#c0c0c0" />
+                </Box>
+                <Box args={[2, 4, 2]} position={[0, 5, 0]}>
+                   <meshStandardMaterial color="#ffd700" />
+                </Box>
+                {building.isComplete && (
+                   <pointLight position={[0, 8, 0]} color="#00ffff" intensity={2} distance={10} />
+                )}
+              </>
+            )}
+
             {!building.isComplete && (
-              <Html distanceFactor={12} position={[0, 5, 0]}>
-                <div className="flex flex-col items-center">
-                  <div className="bg-black/80 px-2 py-1 rounded text-[10px] text-white font-bold mb-1 border border-orange-500/30 whitespace-nowrap">
-                    BUILDING: {Math.floor(building.progress)}%
+              <Html distanceFactor={12} position={[0, 6, 0]}>
+                <div className="flex flex-col items-center gap-1">
+                  <div className="bg-black/90 px-3 py-1 rounded-full border border-orange-500/30 whitespace-nowrap shadow-xl">
+                    <span className="text-orange-500 font-black text-[10px] tracking-tighter">CONSTRUCTING {Math.floor(building.progress)}%</span>
                   </div>
-                  <div className="w-24 h-2 bg-black/50 border border-white/20 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-orange-500 transition-all duration-300" 
-                      style={{ width: `${building.progress}%` }} 
-                    />
+                  <div className="w-24 h-1.5 bg-black/40 rounded-full overflow-hidden border border-white/10">
+                    <div className="h-full bg-orange-500 shadow-[0_0_10px_orange]" style={{ width: `${building.progress}%` }} />
                   </div>
                 </div>
               </Html>
@@ -282,56 +406,135 @@ const World: React.FC<WorldProps> = ({
         </SurfaceAligned>
       ))}
 
-      {/* Followers */}
-      {followers.map(follower => (
-        <SurfaceAligned key={follower.id} position={follower.position}>
-          <group>
-            <Float speed={5} rotationIntensity={0.5} floatIntensity={0.2}>
-              {/* Body: height 0.8, base at 0 -> position [0, 0.4, 0] */}
-              <Box args={[0.6, 0.8, 0.4]} position={[0, 0.4, 0]}>
-                <meshStandardMaterial color={
-                  follower.state === AgentState.GATHER ? "#e63946" : 
-                  follower.state === AgentState.BUILD ? "#f4a261" : 
-                  "#457b9d"
-                } />
-              </Box>
-              {/* Head: diameter 0.4, sits on top -> position [0, 1.0, 0] */}
-              <Sphere args={[0.3]} position={[0, 1.0, 0]}>
-                <meshStandardMaterial color="#fefae0" />
-              </Sphere>
-              {/* Wood Carrying Item */}
-              {follower.woodCarrying > 0 && (
-                <Box args={[0.2, 0.4, 0.2]} position={[0.4, 0.4, 0]}>
-                  <meshStandardMaterial color="#604a32" />
-                </Box>
-              )}
-            </Float>
-            <Html distanceFactor={10} position={[0, 1.8, 0]}>
-               <span className="text-[8px] bg-black/40 px-1 rounded text-white/70 uppercase whitespace-nowrap">
-                 {follower.state}
-               </span>
-            </Html>
-          </group>
-        </SurfaceAligned>
-      ))}
+      {followers.map(follower => {
+        const isInteracting = (follower.state === AgentState.GATHER || follower.state === AgentState.BUILD || follower.state === AgentState.TRAIN);
+        const targetEntity = isInteracting ? 
+            (follower.state === AgentState.GATHER ? trees.find(t => t.id === follower.targetId) : buildings.find(b => b.id === follower.targetId)) 
+            : null;
+        const isCloseEnough = targetEntity && follower.position.distanceTo(targetEntity.position) <= INTERACTION_RANGE + 1.0;
+        
+        return (
+          <SurfaceAligned key={follower.id} position={follower.position}>
+            <FollowerMesh 
+              follower={follower} 
+              isSelected={selectedFollowerId === follower.id} 
+              isAnimating={isInteracting && isCloseEnough}
+              onClick={handleFollowerClick(follower.id)}
+            />
+          </SurfaceAligned>
+        );
+      })}
 
-      {/* Building Ghost (Placement Mode) */}
       {isPlacementMode && ghostPos && (
         <SurfaceAligned position={ghostPos}>
-          <group>
-            <Box args={[3.2, 2.2, 3.2]} position={[0, 1.1, 0]}>
-              <meshStandardMaterial color="#00ff00" transparent opacity={0.3} wireframe />
-            </Box>
-            <Cone args={[2.7, 2.2, 4]} position={[0, 3.3, 0]} rotation={[0, Math.PI / 4, 0]}>
-              <meshStandardMaterial color="#00ff00" transparent opacity={0.2} wireframe />
-            </Cone>
-          </group>
+          <Box args={[4, 0.2, 4]} position={[0, 0.1, 0]}>
+            <meshStandardMaterial color="#00ff00" transparent opacity={0.4} />
+          </Box>
+          <Box args={[3.5, 3.5, 3.5]} position={[0, 1.75, 0]}>
+            <meshStandardMaterial color="#00ff00" transparent opacity={0.1} wireframe />
+          </Box>
         </SurfaceAligned>
       )}
 
-      <Sphere args={[100, 32, 32]} inverted>
-        <meshBasicMaterial color="#050505" side={THREE.BackSide} />
+      <Sphere args={[120, 32, 32]} inverted>
+        <meshBasicMaterial color="#000" side={THREE.BackSide} />
       </Sphere>
+    </group>
+  );
+};
+
+interface FollowerMeshProps {
+  follower: Follower;
+  isSelected: boolean;
+  isAnimating: boolean;
+  onClick: (e: ThreeEvent<MouseEvent>) => void;
+}
+
+const FollowerMesh: React.FC<FollowerMeshProps> = ({ follower, isSelected, isAnimating, onClick }) => {
+  const groupRef = useRef<THREE.Group>(null);
+
+  useFrame((state) => {
+    if (groupRef.current) {
+      if (isAnimating) {
+        const speed = 12;
+        const pitch = Math.abs(Math.sin(state.clock.elapsedTime * speed)) * 0.7;
+        groupRef.current.rotation.x = pitch;
+      } else {
+        groupRef.current.rotation.x = THREE.MathUtils.lerp(groupRef.current.rotation.x, 0, 0.15);
+      }
+    }
+  });
+
+  const getRoleColor = () => {
+    if (follower.role === FollowerRole.SHAMAN) return "#7b2cbf";
+    if (follower.role === FollowerRole.WARRIOR) return "#c1121f";
+    
+    switch (follower.state) {
+      case AgentState.GATHER: return "#2d6a4f";
+      case AgentState.BUILD: return "#d4a373";
+      case AgentState.DELIVER: return "#ff9f1c";
+      default: return "#457b9d";
+    }
+  };
+
+  return (
+    <group onClick={onClick}>
+      <group ref={groupRef}>
+        <Float speed={5} rotationIntensity={0.4} floatIntensity={0.25}>
+          {/* Main Body */}
+          <Box args={[0.7, follower.role === FollowerRole.SHAMAN ? 1.4 : 1, 0.5]} position={[0, follower.role === FollowerRole.SHAMAN ? 0.7 : 0.5, 0]}>
+            <meshStandardMaterial color={getRoleColor()} />
+          </Box>
+          
+          {/* Head */}
+          <Sphere args={[follower.role === FollowerRole.SHAMAN ? 0.4 : 0.35]} position={[0, follower.role === FollowerRole.SHAMAN ? 1.6 : 1.2, 0]}>
+            <meshStandardMaterial color={follower.role === FollowerRole.WARRIOR ? "#333" : "#fefae0"} />
+          </Sphere>
+          
+          {/* Warrior Horns / Decoration */}
+          {follower.role === FollowerRole.WARRIOR && (
+            <group position={[0, 1.2, 0]}>
+               <Cone args={[0.1, 0.4, 4]} position={[0.25, 0.3, 0]} rotation={[0.4, 0, -0.4]}>
+                 <meshStandardMaterial color="#fff" />
+               </Cone>
+               <Cone args={[0.1, 0.4, 4]} position={[-0.25, 0.3, 0]} rotation={[0.4, 0, 0.4]}>
+                 <meshStandardMaterial color="#fff" />
+               </Cone>
+            </group>
+          )}
+
+          {/* Shaman Glow */}
+          {follower.role === FollowerRole.SHAMAN && (
+             <pointLight intensity={0.5} distance={3} color="#bc4ed8" />
+          )}
+          
+          {/* Wood visual stack */}
+          {follower.woodCarrying > 0 && (
+             <Box args={[0.9, 0.3, 0.4]} position={[0, 0.15, 0.3]}>
+                <meshStandardMaterial color="#4a3728" />
+             </Box>
+          )}
+        </Float>
+      </group>
+      
+      {/* Selection Ring */}
+      {isSelected && (
+        <group position={[0, 0.1, 0]}>
+          <Torus args={[1.2, 0.05, 16, 100]} rotation={[Math.PI / 2, 0, 0]}>
+            <meshBasicMaterial color="#00f2ff" transparent opacity={0.6} />
+          </Torus>
+          <pointLight intensity={1} distance={2} color="#00f2ff" />
+        </group>
+      )}
+
+      <Html distanceFactor={10} position={[0, 2.5, 0]}>
+          <div className="flex flex-col items-center">
+            <span className={`text-[9px] font-black bg-black/80 px-2 py-0.5 rounded-full uppercase border ${isSelected ? 'text-cyan-400 border-cyan-400/50 scale-110 shadow-[0_0_10px_#00f2ff55]' : 'text-white/80 border-white/10'}`}>
+              {follower.role}
+            </span>
+            <span className="text-[7px] text-white/40 mt-1 uppercase tracking-tighter">{follower.state}</span>
+          </div>
+      </Html>
     </group>
   );
 };
