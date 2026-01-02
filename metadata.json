@@ -1,0 +1,5 @@
+{
+  "name": "Populous: Sphere Engine Prototype",
+  "description": "A 3D spherical world simulation featuring autonomous agents, resource gathering (wood), and a collaborative building system inspired by Populous: The Beginning. Uses a custom spherical coordinate system and reactive state loop.",
+  "requestFramePermissions": []
+}
